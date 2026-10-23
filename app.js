@@ -533,7 +533,7 @@ async function askQuestion() {
         const embedding = await getEmbedding(question);
 
         // Step 2: Search for similar sentences
-        const results = await searchSentences(embedding);
+        const results = await searchSentences(embedding, 50);
 
         // Step 3: Group by talk (with similarity scores and URLs)
         const topTalks = groupByTalk(results || []);
@@ -546,7 +546,9 @@ async function askQuestion() {
         // Function fetches the talk text itself, so the browser can't
         // inject its own "context" into the prompt
         const talkIds = topTalks.map(t => t.talk_id);
-        const answer = await generateAnswer(question, talkIds);
+        // The matched sentences (best first), so the context is built around them
+        const sentenceIds = results.filter(r => talkIds.includes(r.talk_id)).map(r => r.id).slice(0, 20);
+        const answer = await generateAnswer(question, talkIds, sentenceIds);
 
         // Step 5: Save to the user's history (RLS: only they can read it)
         saveHistory(question, answer, talkIds);
@@ -618,12 +620,12 @@ async function getEmbedding(text) {
 }
 
 // Search sentences using vector similarity
-async function searchSentences(embedding) {
+async function searchSentences(embedding, matchCount = 20) {
     if (!supabaseClient) throw new Error('Supabase not configured');
 
     const { data, error } = await supabaseClient.rpc('match_sentences', {
         query_embedding: embedding,
-        match_count: 20
+        match_count: matchCount
     });
 
     if (error) throw new Error(`Database search failed: ${error.message}`);
@@ -650,7 +652,10 @@ function groupByTalk(sentences) {
     }
 
     return Object.values(talkMap)
-        .sort((a, b) => b.totalSimilarity / b.sentences.length - a.totalSimilarity / a.sentences.length)
+        // Rank by total similarity: matches all score in a narrow band, so the
+        // average favors talks that mention the topic once; the sum rewards
+        // talks that keep coming back to it
+        .sort((a, b) => b.totalSimilarity - a.totalSimilarity)
         .slice(0, 3)
         .map(talk => ({
             talk_id: talk.talk_id,
@@ -658,20 +663,17 @@ function groupByTalk(sentences) {
             speaker: talk.speaker,
             url: talk.url,
             text: talk.sentences.join(' '),
-            // TODO: Is average similarity the right metric? Alternatives worth researching:
-            // - Max similarity (best single match per talk)
-            // - Average of top-3 sentences (reduces noise from weak matches)
-            // - Weighted by sentence count (rewards talks with more matches)
             avgSimilarity: talk.totalSimilarity / talk.sentences.length
         }));
 }
 
 // Generate answer via Edge Function (it fetches the talks' full text itself)
-async function generateAnswer(question, talkIds) {
+async function generateAnswer(question, talkIds, sentenceIds) {
     const { data, error } = await supabaseClient.functions.invoke('generate-answer', {
         body: {
             question: question,
-            talk_ids: talkIds
+            talk_ids: talkIds,
+            sentence_ids: sentenceIds
         }
     });
 

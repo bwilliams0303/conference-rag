@@ -1,11 +1,12 @@
 // generate-answer: answers a question using General Conference talks.
 //
-// POST { "question": "...", "talk_ids": ["<uuid>", ...] }
+// POST { "question": "...", "talk_ids": ["<uuid>", ...], "sentence_ids": ["<uuid>", ...] }
 //   ->  { "answer": "...", "sources": [{ "talk_id", "title", "speaker", "url" }] }
 // POST { "ping": true }  ->  { "ok": true }   (readiness check, no database or OpenAI call)
 //
 // The browser only sends the question and the ids of the talks that semantic
-// search found (1-3, most relevant first). The talk text is read here, from the
+// search found (1-3, most relevant first), plus the ids of the matched sentences
+// (optional, best first) so the context can be built around them. The talk text is read here, from the
 // database, so a caller can't smuggle their own "talk" text into the prompt.
 // The OpenAI key never leaves the server. Before spending it, the function
 // checks, in order: the caller's origin (CORS), a signed-in user session,
@@ -13,9 +14,11 @@
 import { corsHeaders, jsonResponse } from "../_shared/cors.ts";
 import { requireUser } from "../_shared/auth.ts";
 
-const MAX_BODY_BYTES = 2048;
+const MAX_BODY_BYTES = 4096; // question + 3 talk ids + 20 sentence ids
 const MAX_QUESTION_CHARS = 500;
 const MAX_TALKS = 3;
+const MAX_SENTENCE_IDS = 20; // match_sentences returns 20 by default
+const WINDOW = 3; // sentences of context kept on each side of a match
 // Context caps: these bound the tokens (and so the cost) of every call.
 // 20,000 characters is about 5,000 input tokens at most, however long the talks are.
 const MAX_CHARS_PER_TALK = 8000;
@@ -35,6 +38,7 @@ const SYSTEM_PROMPT = [
 ].join("\n");
 
 type SentenceRow = {
+  id: string;
   talk_id: string;
   title: string | null;
   speaker: string | null;
@@ -66,6 +70,41 @@ function buildTalkText(sentences: string[], maxChars: number): string {
   return text;
 }
 
+// Builds a talk's context around the sentences that semantic search matched
+// (best match first): each match brings WINDOW sentences on either side,
+// as long as the result stays under maxChars. Gaps between windows are
+// marked with "…". With no matches in this talk, falls back to its opening.
+function buildMatchedContext(group: SentenceRow[], matchedIds: string[], maxChars: number): string {
+  const texts = group.map((row) => (typeof row.text === "string" ? row.text.trim() : ""));
+  const indexById = new Map(group.map((row, i) => [row.id.toLowerCase(), i]));
+  const hits = matchedIds
+    .map((id) => indexById.get(id))
+    .filter((i): i is number => i !== undefined);
+  if (hits.length === 0) return buildTalkText(texts.filter((t) => t !== ""), maxChars);
+
+  const render = (chosen: Set<number>) => {
+    const parts: string[] = [];
+    let prev = -1;
+    for (const i of [...chosen].sort((a, b) => a - b)) {
+      if (!texts[i]) continue;
+      parts.push(prev >= 0 && i !== prev + 1 ? `… ${texts[i]}` : texts[i]);
+      prev = i;
+    }
+    return parts.join(" ");
+  };
+
+  let chosen = new Set<number>();
+  for (const hit of hits) {
+    const candidate = new Set(chosen);
+    for (let i = Math.max(0, hit - WINDOW); i <= Math.min(texts.length - 1, hit + WINDOW); i++) {
+      candidate.add(i);
+    }
+    if (render(candidate).length <= maxChars) chosen = candidate;
+    else if (chosen.size === 0) return buildTalkText([texts[hit]], maxChars);
+  }
+  return render(chosen);
+}
+
 Deno.serve(async (req) => {
   // Browser preflight: allowed origins get CORS headers, others get none
   if (req.method === "OPTIONS") {
@@ -87,7 +126,7 @@ Deno.serve(async (req) => {
     return jsonResponse(req, { error: "Request too large" }, 413);
   }
 
-  let body: { question?: unknown; talk_ids?: unknown; ping?: unknown };
+  let body: { question?: unknown; talk_ids?: unknown; sentence_ids?: unknown; ping?: unknown };
   try {
     body = JSON.parse(raw);
   } catch {
@@ -124,6 +163,23 @@ Deno.serve(async (req) => {
   }
   const talkIds = [...new Set((rawIds as string[]).map((id) => id.toLowerCase()))];
 
+  // Optional: ids of the sentences semantic search matched, best first. They
+  // only pick which parts of the fetched talks to use; the text still comes
+  // from the database.
+  const rawSentenceIds = body?.sentence_ids ?? [];
+  if (
+    !Array.isArray(rawSentenceIds) ||
+    rawSentenceIds.length > MAX_SENTENCE_IDS ||
+    !rawSentenceIds.every((id) => typeof id === "string" && UUID_PATTERN.test(id))
+  ) {
+    return jsonResponse(
+      req,
+      { error: `'sentence_ids' must be at most ${MAX_SENTENCE_IDS} sentence ids` },
+      400,
+    );
+  }
+  const sentenceIds = [...new Set((rawSentenceIds as string[]).map((id) => id.toLowerCase()))];
+
   // Rate limit, called with the user's own token: the database reads their
   // id from the JWT (auth.uid()), so this code can't charge someone else
   const { data: allowed, error: limitError } = await auth.user.supabase.rpc(
@@ -152,7 +208,7 @@ Deno.serve(async (req) => {
   // Read the talks with the user's own client, so row-level security applies
   const { data: rows, error: talksError } = await auth.user.supabase
     .from("sentence_embeddings")
-    .select("talk_id, title, speaker, url, sentence_num, text")
+    .select("id, talk_id, title, speaker, url, sentence_num, text")
     .in("talk_id", talkIds)
     .order("talk_id")
     .order("sentence_num")
@@ -178,10 +234,7 @@ Deno.serve(async (req) => {
     if (!group) continue;
     const remaining = MAX_CONTEXT_CHARS - contextChars;
     if (remaining <= 0) break;
-    const sentences = group
-      .map((row) => (typeof row.text === "string" ? row.text.trim() : ""))
-      .filter((text) => text !== "");
-    const text = buildTalkText(sentences, Math.min(MAX_CHARS_PER_TALK, remaining));
+    const text = buildMatchedContext(group, sentenceIds, Math.min(MAX_CHARS_PER_TALK, remaining));
     if (!text) continue;
     contextChars += text.length;
     talks.push({
