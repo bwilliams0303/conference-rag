@@ -94,13 +94,9 @@ Common installation methods:
 
 Verify: `supabase --version`
 
-#### 2. Initialize Supabase
+#### 2. Log In to the CLI
 
-```bash
-supabase init
-```
-
-This creates `supabase/config.toml`. You don't need `supabase link` (it asks for your database password); instead, pass `--project-ref YOUR_PROJECT_REF` (from `config.secret.json`) to each command below. The CLI authenticates with your access token: run `supabase login`, or set the `SUPABASE_ACCESS_TOKEN` environment variable.
+The `supabase/` folder (with `config.toml` and the functions) **already ships in the repo**, so do **not** run `supabase init`; it would complain that the project already exists. You also don't need `supabase link` (it asks for your database password); instead, pass `--project-ref YOUR_PROJECT_REF` (from `config.secret.json`) to each command below. The CLI authenticates with your access token: run `supabase login`, or set the `SUPABASE_ACCESS_TOKEN` environment variable.
 
 #### 3. Set Your OpenAI Key as a Secret
 
@@ -112,26 +108,32 @@ supabase secrets set --env-file path/to/secrets.env --project-ref YOUR_PROJECT_R
 
 where `secrets.env` contains one line, `OPENAI_API_KEY=...`. Delete the file afterwards. `supabase secrets list --project-ref YOUR_PROJECT_REF` shows each secret's name and a digest, never its value.
 
-> 💡 Give the app its own OpenAI **project** key with a monthly budget limit, so a bug or abuse can't run up a large bill.
+> 💡 Give the app its own OpenAI **project** key, and set a **monthly budget limit** on that project (OpenAI dashboard → project → Limits), so a bug or abuse can't run up a large bill.
 
-#### 4. Create the embed-question Function
+#### 4. Read the embed-question Function
 
-Ask your AI assistant to help you create the Edge Function:
+The function is **already written** for you. Your job is to read and understand it, not to write it from scratch: open `supabase/functions/embed-question/index.ts` and its helpers, and ask your AI assistant to walk you through them (*"Explain this Edge Function line by line. What does each check protect against?"*).
 
-> 🤖 **Tell your AI assistant**: *"I need to create a Supabase Edge Function called `embed-question`. It should:*
+Here is what it does, described as a spec:
+
+> 🤖 **The function**: *a Supabase Edge Function called `embed-question`. It:*
 > - *Accept a POST request with `{ "question": "..." }` in the body (and `{ "ping": true }` as a free readiness check)*
 > - *Use the OpenAI API to generate an embedding with `text-embedding-3-small`*
 > - *Return `{ "embedding": [...] }` in the response*
 > - *Handle CORS for my GitHub Pages origin only (not `*`)*
 > - *Verify the caller is a signed-in user, limit the question length, and enforce a per-user rate limit before calling OpenAI"*
 
-The function lives at: `supabase/functions/embed-question/index.ts`, with shared helpers in `supabase/functions/_shared/cors.ts` and `supabase/functions/_shared/auth.ts`.
+The function lives at `supabase/functions/embed-question/index.ts`, with shared helpers in `supabase/functions/_shared/cors.ts` and `supabase/functions/_shared/auth.ts`.
 
-> ⚠️ **Auth note**: Keep `verify_jwt = true` (the default) for this function in `supabase/config.toml`, so the platform rejects requests without a valid JWT before your code runs. Inside the function, confirm the JWT belongs to a **user** (not just an API key) with `createSupabaseContext(req, { auth: 'user' })` from the official `@supabase/server` package. Don't use the legacy `SUPABASE_ANON_KEY`; Supabase is retiring the anon/service_role keys.
+> ⚠️ **Auth note**: `supabase/config.toml` keeps `verify_jwt = true` for this function, so the platform rejects requests without a valid JWT before the code runs (this is why you deploy *without* `--no-verify-jwt`). Inside the function, `_shared/auth.ts` confirms the JWT belongs to a **user** (not just an API key) with `createSupabaseContext(req, { auth: 'user' })` from the official `@supabase/server` package. It doesn't use the legacy `SUPABASE_ANON_KEY`; Supabase is retiring the anon/service_role keys.
 
 > 🔒 **Rate limiting**: the function calls the `consume_rate_limit()` database function *with the user's own token*. The database reads the user's id from the verified JWT (`auth.uid()`), so the function never needs the secret key, and users can't reset their own counters because the table itself isn't writable by them.
 
-#### 5. Deploy the Function
+#### 5. Allow Your Site's Origin (CORS)
+
+Before deploying, open `supabase/functions/_shared/cors.ts` and edit `ALLOWED_ORIGINS` so it lists **your own** GitHub Pages origin: scheme + host only, no path, e.g. `https://YOUR-USERNAME.github.io`. If you skip this, the browser will block every call to your functions.
+
+#### 6. Deploy the Function
 
 ```bash
 supabase functions deploy embed-question --project-ref YOUR_PROJECT_REF --use-api
@@ -155,6 +157,8 @@ Try searching for *"How can I find peace during hard times?"* — notice how it 
 - [ ] `scripts/output/embeddings.jsonl` exists (your safety net!)
 - [ ] `05_update_embeddings.py` reports every row updated and the HNSW index built
 - [ ] `supabase --version` shows a version number
+- [ ] `ALLOWED_ORIGINS` in `_shared/cors.ts` lists your GitHub Pages origin
+- [ ] You set a budget limit on your OpenAI project
 - [ ] `embed-question` function deployed without errors
 - [ ] You can see the function in Supabase Dashboard → Edge Functions
 - [ ] On your site: **🧠 Semantic Search** turns green and returns results!

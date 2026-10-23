@@ -28,21 +28,30 @@ python scripts/01_create_schema.py
 This script creates:
 - **pgvector extension** — Adds vector data type and similarity operators to PostgreSQL
 - **`sentence_embeddings` table** — Stores talk sentences with their embedding vectors (🔒 **auth-only**)
-- **`page_views` table** — Records every page visit (🌍 **public write**, count-only read)
+- **`page_views` / `page_view_daily` tables** — The page visit counter (🌍 **public**, count-only; visitors can't read or write rows directly)
+- **`question_history` table** — Each user's private log of past questions (the Step 07 feature, 🔒 **per-user RLS**)
+- **`api_rate_limits` table** — Per-user counters for the Edge Functions (no direct access for users)
 - **RLS policies + privileges** — Controls who can access each table
-- **`match_sentences()` function** — A stored procedure for vector similarity search
-- **`page_view_count()` function** — Returns the total for the page view counter
+- **Database functions** — `match_sentences()` (vector search), `page_view_count()` and `record_page_view()` (the counter), `consume_rate_limit()` (rate limiting), plus `set_embeddings()` and `reset_sentence_embeddings()` (used by the import scripts)
+
+> 🔢 The scripts are numbered **01–05** and run in order (the "Step 1…5" in their docstrings refers to these script numbers, not the numbered guides in `steps/`).
 
 > 💡 **Ask your AI assistant**: *"What is pgvector and how does cosine similarity search work?"*
 
-### Two Tables, Two Access Levels
+### Who Can Use What
 
-| Table | Who can read? | Who can write? | Why? |
-|-------|--------------|----------------|------|
-| `page_views` | 🔢 Anyone, but only the total via `page_view_count()` | 🌍 Anyone (`page_url`, `user_agent` only) | Public analytics — visitors' rows stay private |
-| `sentence_embeddings` | 🔒 Authenticated users only | 🔒 Service role only | Protected content — requires login |
+| Object | Who can use it? | Why? |
+|--------|----------------|------|
+| `sentence_embeddings` (table) | 🔒 Read: signed-in users. Write: service role only | Protected content — requires login |
+| `page_views` / `page_view_daily` (tables) | 🔢 Nobody directly; anyone gets the total via `page_view_count()` | Public analytics — visitors' rows stay private |
+| `record_page_view()` | 🌍 Anyone | Counts a visit into `page_view_daily` (one row per day), so anonymous visitors can't fill your database |
+| `question_history` (table) | 🔒 Signed-in users: read and insert **their own** rows only | Private per-user data (per-user RLS) |
+| `api_rate_limits` (table) | ⛔ Nobody via the API | Only `consume_rate_limit()` touches it |
+| `consume_rate_limit()` | 🔒 Signed-in users (called by the Edge Functions) | Limits how much OpenAI spend one user can cause |
+| `match_sentences()` | 🔒 Signed-in users | Semantic search, still subject to RLS |
+| `set_embeddings()`, `reset_sentence_embeddings()` | 🔑 Service role only | Used by scripts 03 and 05 |
 
-This is **Row Level Security (RLS)** in action. Both tables have RLS enabled, but their *policies* define very different access rules.
+This is **Row Level Security (RLS)** in action. These tables all have RLS enabled, but their *policies* and privileges define very different access rules.
 
 ### Understanding the Schema
 
@@ -53,11 +62,11 @@ ON sentence_embeddings FOR SELECT
 TO authenticated          -- ← Only logged-in users
 USING (true);
 
--- page_views: Public writes, no public reads
-CREATE POLICY "Allow public inserts"
-ON page_views FOR INSERT
-TO anon, authenticated    -- ← Anyone, even without login
-WITH CHECK (true);
+-- question_history: Private per-user data
+CREATE POLICY "Users read own history"
+ON question_history FOR SELECT
+TO authenticated
+USING ((select auth.uid()) = user_id);   -- ← Only YOUR rows
 ```
 
 Postgres checks two layers, in order:
@@ -65,15 +74,15 @@ Postgres checks two layers, in order:
 1. **Privileges** (`GRANT` / `REVOKE`) — can this role touch this table or column *at all*? If not, the request fails with `permission denied`.
 2. **RLS policies** — of the rows the role may touch, *which ones*? Rows that fail the policy are silently filtered out.
 
-The script uses both. For example, `page_views` grants `INSERT` on only `page_url` and `user_agent`, so a visitor can't backdate `visited_at`, and it has no `SELECT` policy at all. The counter calls `page_view_count()` instead, a `SECURITY DEFINER` function that runs as the table owner and returns only a number.
+The script uses both. For example, anonymous visitors get no direct privileges on the page-view tables at all. The site calls `record_page_view()` to count a visit and `page_view_count()` to read the total; both are `SECURITY DEFINER` functions that run as the table owner and expose nothing but that one action. And `question_history` has a policy of `auth.uid() = user_id`, so each user sees only their own rows.
 
-> ⚠️ **Why not let anyone read `page_views`?** After a magic-link login, the page URL contains your access and refresh tokens (`#access_token=...`). An earlier version of this app recorded the full URL in a world-readable table — anyone with the anon key could have read live sessions. "No secrets here" is a claim you have to keep proving as the app changes.
+> ⚠️ **Why not let anyone read the page-view rows?** After a magic-link login, the page URL contains your access and refresh tokens (`#access_token=...`). An earlier version of this app recorded the full URL in a world-readable table — anyone with the publishable key could have read live sessions. "No secrets here" is a claim you have to keep proving as the app changes.
 
 > 💡 **Ask your AI assistant**: *"Explain Row Level Security in PostgreSQL. Why is it more secure than checking permissions in application code?"*
 
 ### 🧪 Hands-On: See RLS in Action
 
-After the script completes, try this experiment. Ask your AI assistant to help you write a quick Python snippet that uses **just the anon key** (not the service key) to:
+After the script completes, try this experiment. Ask your AI assistant to help you write a quick Python snippet that uses **just the publishable key** (not the secret key) to:
 
 1. **Call `page_view_count()`** → ✅ Should work! Anyone can see the total.
 2. **Query `page_views` rows** → ❌ Should fail with **permission denied**! The anon role has no `SELECT` privilege.
@@ -88,10 +97,10 @@ import json
 with open('config.public.json') as f:
     public = json.load(f)
 
-# Connect with the ANON key (not service key!)
+# Connect with the publishable key (not the secret key!)
 client = create_client(public['SUPABASE_URL'], public['SUPABASE_ANON_KEY'])
 
-# This works — page_view_count() is executable by anon
+# This works — page_view_count() is executable by anon (the role the publishable key maps to)
 count = client.rpc('page_view_count').execute().data
 print(f"page_view_count(): {count} ✅")
 
@@ -108,7 +117,9 @@ print(f"sentence_embeddings: {len(result.data)} rows (expected: 0) 🔒")
 
 > 💡 **Try it!** Seeing the output first-hand makes the RLS concept click.
 
-> 🤔 **Think about it**: The anon key is in your `config.public.json`. Anyone can see it. So why is your data still safe?
+> 🧪 **Prove per-user RLS too**: `scripts/sql/test_question_history_rls.sql` creates two throwaway users inside a transaction and checks that each sees only their own `question_history` rows, can't insert rows for the other, and can't update or delete. Paste it into the Supabase SQL editor; it ends with a `ROLLBACK`, so nothing is kept. Each check prints PASS or FAIL.
+
+> 🤔 **Think about it**: The publishable key is in your `config.public.json`. Anyone can see it. So why is your data still safe?
 
 ### The Security Model
 
@@ -116,7 +127,7 @@ print(f"sentence_embeddings: {len(result.data)} rows (expected: 0) 🔒")
 ┌────────────────────────────────────────┐
 │ Supabase-Managed Security              │
 │                                        │
-│  anon key → RLS decides what you see   │
+│  publishable key → RLS decides what you see   │
 │  ┌─────────────────┐  ┌────────────┐  │
 │  │ page_views      │  │ embeddings │  │
 │  │ 🔢 public count │  │ 🔒 auth    │  │
@@ -145,7 +156,8 @@ print(f"sentence_embeddings: {len(result.data)} rows (expected: 0) 🔒")
 
 - [ ] Script prints "✅ Database schema created successfully!"
 - [ ] Script prints "✅ Table verified" with a row count
-- [ ] You can see both `sentence_embeddings` and `page_views` in Supabase Dashboard → Table Editor
+- [ ] You can see `sentence_embeddings`, `question_history`, and the page-view tables in Supabase Dashboard → Table Editor
 - [ ] (Optional) The RLS test snippet shows the page view count, a permission error for `page_views` rows, and 0 rows from `sentence_embeddings`
+- [ ] (Optional) `scripts/sql/test_question_history_rls.sql` prints PASS for every check
 
 ## → Next: [Step 04: Scrape & Import Data](04_scrape_and_import.md)

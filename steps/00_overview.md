@@ -58,7 +58,7 @@ Your app has three search modes that **light up** as you complete each milestone
 **You'll need:**
 - [GitHub](https://github.com) account
 - [Supabase](https://supabase.com) account (free tier)
-- [OpenAI API key](https://platform.openai.com/api-keys) (about $0.02 of embeddings, plus RAG answers)
+- [OpenAI API key](https://platform.openai.com/api-keys) (about $0.01–0.02 of embeddings, plus 1–2 cents per RAG answer)
 - Python 3.9+ installed locally
 - An AI coding assistant (pick one):
   - **Antigravity** (VS Code-based IDE) — [antigravity.google](https://antigravity.google)
@@ -72,7 +72,8 @@ Your app has three search modes that **light up** as you complete each milestone
 
 ## Cost & Time
 
-- 💰 **About $0.02** for embeddings (~26,000 sentences), plus a fraction of a cent per RAG answer
+- 💰 **About $0.01–0.02** for embeddings (~26,000 sentences), plus roughly **1–2 cents per RAG answer** (GPT-4o)
+- 🛡️ Set a monthly budget limit on your OpenAI project (Step 05) so a bug or abuse can't surprise you
 - ⏱️ **~2 hours** total across all steps
 
 ## Let's get started! → [Step 01: Fork & Deploy](01_fork_and_deploy.md)

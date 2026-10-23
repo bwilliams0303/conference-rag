@@ -43,7 +43,7 @@ Browser (GitHub Pages)
   → Supabase Auth (magic link login)
   → Edge Function: embed-question (OpenAI API)
   → Supabase Database (pgvector similarity search)
-  → Edge Function: generate-answer (GPT-4o)
+  → Edge Function: generate-answer (GPT-4o; receives talk ids, reads the talks itself)
   → Display answer with source citations
 ```
 
@@ -78,16 +78,16 @@ These are the core concepts students should understand by the end. When opportun
 ### 5. Row Level Security (RLS)
 - **What**: Database-level access control policies that filter data per-user
 - **Why it matters**: Security that can't be bypassed by application bugs — the database itself enforces the rules
-- **Key insight**: Anyone can write to `page_views` and read its total via `page_view_count()`, but `sentence_embeddings` requires authentication — same database, same anon key, different privileges and policies
-- **Teach them**: Run the Step 03 RLS contrast test (query both tables with the anon key), explain the difference between `TO anon` and `TO authenticated` policies, why database-level security is more robust than app-level checks
+- **Key insight**: Anyone can read the visit total via `page_view_count()`, but `sentence_embeddings` requires authentication and `question_history` shows each user only their own rows — same database, same publishable key, different privileges and policies
+- **Teach them**: Run the Step 03 RLS contrast test (query the tables with the publishable key) and `scripts/sql/test_question_history_rls.sql` (per-user RLS), explain the difference between `TO anon` and `TO authenticated` policies, why database-level security is more robust than app-level checks
 
 ### 6. Authentication & Security Architecture
 - **What**: A layered security model combining Supabase-managed auth (magic links, JWTs, RLS) with self-built security (Edge Functions)
 - **Why it matters**: Real applications always have multiple security layers — understanding which layer protects what is fundamental
 - **Key insight**: There are two distinct security layers students must understand:
-  1. **Supabase-managed**: The anon key + RLS policies protect your database. Supabase handles this for you.
+  1. **Supabase-managed**: The publishable key + RLS policies protect your database. Supabase handles this for you.
   2. **Self-built**: Supabase can't protect your OpenAI key — you build Edge Functions as the secure intermediary.
-- **Teach them**: How magic links work, JWT tokens, why the anon key is safe to expose, why the service_role key is dangerous, how Edge Functions verify auth before calling OpenAI
+- **Teach them**: How magic links work, JWT tokens, why the publishable (anon) key is safe to expose, why the secret (service_role) key and the account access token are dangerous, how Edge Functions verify auth before calling OpenAI
 ### 7. Production Deployment
 - **What**: Taking code from development to a live, publicly-accessible application
 - **Why it matters**: Building something real that others can use is deeply satisfying and professionally valuable
@@ -100,8 +100,8 @@ These are the core concepts students should understand by the end. When opportun
 conference-rag/
 ├── index.html, app.js, styles.css   # Frontend (static site)
 ├── config.js                         # Loads config.public.json for browser
-├── config.public.json                # Supabase URL + anon key (safe to commit)
-├── config.secret.json                # API keys & service keys (git-ignored)
+├── config.public.json                # Supabase URL + publishable key (safe to commit)
+├── config.secret.json                # OpenAI key, secret key, access token (git-ignored)
 ├── steps/                            # Step-by-step assignment guides (00-07)
 ├── scripts/                          # Pipeline scripts (run in order)
 │   ├── 01_create_schema.py           # Creates DB schema via Supabase API
@@ -113,7 +113,7 @@ conference-rag/
 └── supabase/functions/               # Edge Functions (TypeScript/Deno)
     ├── _shared/                      # Shared auth & CORS modules
     ├── embed-question/               # Converts questions to embeddings
-    └── generate-answer/              # Generates AI answers from context
+    └── generate-answer/              # Generates AI answers from talk ids
 ```
 
 ## Configuration: Public vs Secret
@@ -122,10 +122,12 @@ The project splits configuration into two files:
 
 | File | Contains | Committed? | Used By |
 |------|---------|:-:|-----|
-| `config.public.json` | Supabase URL + anon key | ✅ Yes | Browser (via `config.js`) + scripts |
-| `config.secret.json` | OpenAI API key, Supabase service key, access token, project ref | ❌ Git-ignored | Scripts only (server-side) |
+| `config.public.json` | Supabase URL + publishable key (`sb_publishable_...`, stored as `SUPABASE_ANON_KEY` for compatibility) | ✅ Yes | Browser (via `config.js`) + scripts |
+| `config.secret.json` | OpenAI API key, Supabase secret key (`sb_secret_...`, stored as `SUPABASE_SERVICE_KEY`), access token (`sbp_...`), project ref | ❌ Git-ignored | Scripts only (server-side) |
 
-The anon key is safe to commit because Row Level Security controls what it can access. The service key bypasses all RLS — it must never be exposed.
+The publishable key is safe to commit because Row Level Security controls what it can access. The secret key bypasses all RLS — it must never be exposed. The access token (`sbp_...`) controls the student's whole Supabase account (only `01_create_schema.py` and the index build in `05_update_embeddings.py` use it), so it should have a short expiry. The legacy anon/service_role JWT keys are being retired — don't tell students to copy them; both new keys come from Dashboard → Project Settings → API Keys.
+
+After their first successful login, students should turn off new sign-ups (Authentication → Sign In / Providers), so "authenticated" means only them and strangers can't spend their OpenAI budget with throwaway emails.
 
 ## Data Pipeline
 
@@ -138,48 +140,56 @@ Scripts save intermediate data to `scripts/output/` — **encourage students to 
 | `04_embed_data.py` | `scripts/output/embeddings.jsonl` | One line per sentence: `talk_id`, `sentence_num`, a text hash, and the 1,536-dim vector (base64 float32) |
 | `05_update_embeddings.py` | (updates database) | Embeddings imported to Supabase |
 
-The embedding step (04) is separated from the database import (05) so that a database error won't waste OpenAI API spend (about $0.01–0.02 for ~26,000 sentences; `04_embed_data.py --dry-run` prints the estimate). The embedding file is saved to disk as a safety net.
+Re-running `03_import_data.py` TRUNCATEs `sentence_embeddings` (embeddings included), so after re-running 03 the student must re-run `05_update_embeddings.py` (free: it reads `embeddings.jsonl`; 04 only re-embeds sentences whose text changed). The scripts are numbered 01–05 and run in order; their docstrings say "Step 1…5", which is the script number, not the `steps/` guide number.
+
+The embedding step (04) is separated from the database import (05) so that a database error won't waste OpenAI API spend (about $0.01–0.02 for ~26,000 sentences, measured $0.0121; `04_embed_data.py --dry-run` prints the estimate; each RAG answer with GPT-4o costs roughly 1–2 cents). The embedding file is saved to disk as a safety net.
 
 ## Edge Function Implementation Notes
 
-In Steps 05-06, students are asked to **create their own Edge Functions** with help from their AI assistant. Here's what you need to know to guide them:
+The Edge Functions already ship in `supabase/functions/` (along with `supabase/config.toml`, so students must **not** run `supabase init`). In Steps 05-06 students **read and understand** them with your help — explain them line by line when asked — rather than write them from scratch. Before deploying, they must edit `ALLOWED_ORIGINS` in `supabase/functions/_shared/cors.ts` to their own GitHub Pages origin (scheme + host only, e.g. `https://USER.github.io`), or browser calls will be blocked. Here's what you need to know to guide them:
 
 ### Function Specifications
 
 **`embed-question`** (Step 05):
 - POST endpoint accepting `{ "question": "..." }`
 - Calls OpenAI `text-embedding-3-small` with the question text
-- Returns `{ "embedding": [...] }` (1,536-dimensional vector)
+- Returns `{ "embedding": [...] }` (1,536-dimensional vector); `{ "ping": true }` is a free readiness check
+- Rate limit: 20 per minute, 300 per day per user
 
 **`generate-answer`** (Step 06):
-- POST endpoint accepting `{ "question": "...", "context_talks": [{ title, speaker, text }] }`
-- Calls GPT-4o with the question + context talks as a prompt
-- Instructs GPT to cite which talks it draws from
-- Returns `{ "answer": "..." }`
+- POST endpoint accepting `{ "question": "...", "talk_ids": [up to 3 talk ids] }` (or `{ "ping": true }` as a readiness check)
+- The function fetches those talks' text itself, with the user's own token (so RLS applies). The browser deliberately does **not** send talk text: that would let a caller inject prompts or make the student pay to process arbitrary text
+- Caps the context (8,000 characters per talk, 20,000 total) and calls GPT-4o with `max_tokens` 600
+- Instructs GPT to cite the talks it draws from, and to say so when the talks don't answer the question
+- Returns `{ "answer": "...", "sources": [{ talk_id, title, speaker, url }] }`
+- Rate limit: 5 per minute, 50 per day per user
+- Cost: roughly 1–2 cents per answer (up to ~5k input + 600 output tokens)
 
 ### Auth Pattern (Important!)
 
 Supabase has moved to publishable/secret API keys and asymmetric (ES256) JWT signing keys, and is retiring the legacy anon/service_role keys. Students should:
-1. Keep `verify_jwt = true` (the default) in `supabase/config.toml`, so the platform rejects requests without a valid JWT
+1. Keep `verify_jwt = true` in `supabase/config.toml` (already set for both functions), so the platform rejects requests without a valid JWT. Deploy with `supabase functions deploy NAME --project-ref YOUR_PROJECT_REF --use-api` and **no** `--no-verify-jwt`
 2. Inside the function, confirm the JWT belongs to a signed-in **user** with `createSupabaseContext(req, { auth: 'user' })` from the official `@supabase/server` package (pin an exact version). It verifies the JWT locally against `SUPABASE_JWKS`. `supabase.auth.getUser()` is a slower fallback that also catches revoked sessions
 3. Not read the legacy `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` env vars
 4. Use a shared auth helper module at `supabase/functions/_shared/auth.ts`
 
-The older pattern (deploy with `--no-verify-jwt` and verify manually, as in [github.com/michaeltreynolds/cragger](https://github.com/michaeltreynolds/cragger/tree/main/supabase/functions)) worked around an earlier gateway limitation; it still works as a fallback but reads the legacy anon key.
+(The older `cragger` reference implementation used `--no-verify-jwt` and manual verification with the legacy anon key. That is historical; don't steer students toward it.)
 
 ### Protecting the OpenAI Key
 
 The key is server-side, but anyone who can call the function can spend it. Layers to teach:
-- **Auth**: only signed-in users (and sign-ups can be turned off)
+- **Auth**: only signed-in users, and students turn sign-ups off after their first login so "authenticated" means only them
 - **Input limits**: max body size and question length cap tokens per call
 - **Per-user rate limit**: `consume_rate_limit()` is called with the *user's* token and reads `auth.uid()` from the verified JWT; the table is not writable by users, so they can't reset their own counters
 - **CORS** limited to the student's GitHub Pages origin (defense in depth; it doesn't stop non-browser clients)
-- **A budget limit** on the OpenAI project key
+- **Context caps**: `generate-answer` accepts talk ids (not text) and caps the context it builds
+- **A budget limit** on the OpenAI project key (students set this in Step 05)
 
 ### Key Patterns
 - Functions are written in **TypeScript/Deno** (not Node.js)
 - CORS handling is shared via `_shared/cors.ts`
 - Auth verification is shared via `_shared/auth.ts`
+- Rate limiting and question history live in the database (`consume_rate_limit()`, `question_history`), created by `01_create_schema.py`
 - OpenAI API key is accessed via `Deno.env.get('OPENAI_API_KEY')` (set with `supabase secrets set --env-file`, never typed on the command line)
 
 ## Common Student Questions
@@ -191,7 +201,7 @@ When students ask these, here's the depth of understanding to aim for:
 | "What is an embedding?" | Analogy (e.g., GPS coordinates for meaning), dimensions, similarity |
 | "Why not just use keyword search?" | Vocabulary mismatch problem, synonyms, intent vs. words |
 | "Why do we need Edge Functions?" | API key security, server-side vs. client-side, cost of exposure |
-| "What is RLS?" | Defense in depth, anon key exposure safety, policy as SQL |
+| "What is RLS?" | Defense in depth, why the publishable (anon) key is safe to expose, policy as SQL |
 | "Why split into sentences?" | Chunking tradeoffs, precision vs. recall, aggregation by talk_id |
 | "How does RAG prevent hallucination?" | Grounding in retrieved text, but noting it doesn't eliminate hallucination entirely |
 | "Why not fine-tune instead?" | Cost, updatability, transparency, source attribution |
@@ -203,7 +213,7 @@ When students hit errors, help them debug rather than just giving the fix:
 - **"What does this error message actually tell us?"** — Teach them to read errors
 - **"Let's check the most likely cause first"** — Model systematic debugging
 - **"Try this small test to narrow it down"** — Show incremental isolation
-- **Common issues**: Rate limits on magic links (3/hour), redirect URL configuration, CORS errors, missing environment variables
+- **Common issues**: Rate limits on magic links (built-in email allows only a couple per hour), redirect URLs (use the `/**` wildcard, e.g. `https://USER.github.io/conference-rag/**`), CORS errors (`ALLOWED_ORIGINS` not edited), 429s from the per-user rate limit, missing environment variables
 
 ## Tone & Philosophy
 

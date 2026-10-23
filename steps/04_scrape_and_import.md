@@ -76,6 +76,10 @@ This script:
 4. Saves `scripts/output/sentences.json` locally (for the embedding step)
 5. Verifies the final row count
 
+> ⚠️ **Re-running `03_import_data.py` wipes the table.** It `TRUNCATE`s `sentence_embeddings` first, embeddings included. If you re-run it after Step 05, you must also re-run `python scripts/05_update_embeddings.py` to put the embeddings back. That's free: it reads `scripts/output/embeddings.jsonl` from disk. (`04_embed_data.py` only pays to re-embed sentences whose text changed.)
+
+> 🔢 Reminder: the scripts are numbered **01–05** and run in order; the "Step 1…5" in their docstrings refers to these script numbers.
+
 > 💡 **Check scripts/output/**: After running, look at `scripts/output/talks.json` and `scripts/output/sentences.json` to see the intermediate data. This is what the whole pipeline is processing!
 
 > 💡 **Why no embeddings yet?** We import the text first so you can see keyword search working right away. Embeddings take a few minutes to generate and are added in Step 5. This separation lets you experience the difference between keyword search (works now!) and semantic search (next step).

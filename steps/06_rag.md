@@ -10,7 +10,7 @@
 - What RAG (Retrieval Augmented Generation) is
 - How to combine retrieval + generation for AI-powered answers
 - How context windows work in LLMs
-- How to build a second Edge Function
+- How a second Edge Function turns retrieved context into an answer
 
 ## Why This Matters
 
@@ -18,21 +18,21 @@ This is the culmination of everything you've built. Keyword search finds exact w
 
 ## What to Do
 
-### 1. Create the generate-answer Edge Function
+### 1. Read the generate-answer Edge Function
 
-You need one more Edge Function: `generate-answer`. Ask your AI assistant to help:
+You need one more Edge Function: `generate-answer`. Like `embed-question`, it **already exists** in the repo at `supabase/functions/generate-answer/index.ts`. Read it and make sure you understand it (ask your AI assistant to explain it), rather than writing it from scratch. Here is what it does, described as a spec:
 
-> 🤖 **Tell your AI assistant**: *"I need to create a Supabase Edge Function called `generate-answer`. It should:*
-> - *Accept a POST request with `{ "question": "...", "context_talks": [...] }` in the body*
-> - *Each context talk has `{ title, speaker, text }`*
-> - *Use GPT-4o to generate an answer based on the provided conference talk context*
-> - *The prompt should instruct GPT to cite which talks it draws from*
-> - *Return `{ "answer": "..." }` in the response*
-> - *Handle CORS and verify authentication (same pattern as embed-question)"*
+> 🤖 **The function**: *a Supabase Edge Function called `generate-answer`. It:*
+> - *Accepts a POST request with `{ "question": "...", "talk_ids": [...] }` (up to 3 talk ids), or `{ "ping": true }` as a free readiness check*
+> - *Fetches those talks' text itself, using the signed-in user's own token (so RLS applies)*
+> - *Caps the context: 8,000 characters per talk and 20,000 in total*
+> - *Calls GPT-4o (`max_tokens` 600) with a prompt that tells it to cite the talks it draws from, and to say so when the talks don't answer the question*
+> - *Returns `{ "answer": "...", "sources": [{ "talk_id", "title", "speaker", "url" }] }`*
+> - *Verifies the user, handles CORS, and enforces a per-user rate limit of 5 per minute and 50 per day*
 
-The function lives at: `supabase/functions/generate-answer/index.ts`
+> 🤔 **Why doesn't the browser send the talk text?** Because anything the browser sends can be faked. If the function accepted the text, anyone could paste in arbitrary content: a prompt-injection attack ("ignore your instructions and..."), or just a huge essay that **you** pay GPT-4o to read. Sending only talk ids means the function reads the text from your own database, and only the talks you imported can ever reach the prompt.
 
-> 💡 **Need a reference?** See [github.com/michaeltreynolds/cragger/tree/main/supabase/functions](https://github.com/michaeltreynolds/cragger/tree/main/supabase/functions)
+> 💰 **Cost**: each answer is roughly 1–2 cents (up to about 5,000 input tokens plus 600 output tokens on GPT-4o). The caps and rate limit keep that bounded.
 
 ### What's Happening Behind the Scenes
 
@@ -50,15 +50,15 @@ Your Question: "How can I find peace during hard times?"
     → Groups by talk_id, ranks by relevance
     → Returns top 3 talks
     ↓
-3. Fetch full talk text
-    → Retrieves all sentences for the top 3 talks
-    → Reconstructs complete talk context
+3. generate-answer Edge Function
+    → Browser sends the question + the 3 talk ids (not the text)
+    → Function fetches those talks' sentences itself (RLS applies)
+    → Caps the context, sends question + talks to GPT-4o
+    → Returns a natural language answer + the list of sources
     ↓
-4. generate-answer Edge Function
-    → Sends question + full talk context to GPT-4o
-    → Returns a natural language answer with citations
+4. Display in UI ✨
     ↓
-5. Display in UI ✨
+5. Save the Q&A to your question history (Step 07)
 ```
 
 > 💡 **Ask your AI assistant**: *"What is RAG and why is it better than fine-tuning for this use case?"*
@@ -66,10 +66,10 @@ Your Question: "How can I find peace during hard times?"
 ### 2. Deploy the Function
 
 ```bash
-supabase functions deploy generate-answer --no-verify-jwt
+supabase functions deploy generate-answer --project-ref YOUR_PROJECT_REF --use-api
 ```
 
-> ⚠️ **Same auth pattern as before**: Deploy with `--no-verify-jwt` and handle auth manually inside the function.
+> ⚠️ **Same auth pattern as before**: `config.toml` keeps `verify_jwt = true`, so the platform checks the JWT first and the function then confirms it's a signed-in user. Your `OPENAI_API_KEY` secret and the `ALLOWED_ORIGINS` edit from Step 05 already cover this function too.
 
 ### 3. All Three Lights Green! 🟢🟢🟢
 
@@ -90,6 +90,8 @@ You should get an AI-generated answer with source citations!
 | "Failed to get embedding" | Check Edge Function deployment and that OPENAI_API_KEY secret is set |
 | No search results | Verify data was imported (check row count in Supabase Dashboard) |
 | Login doesn't work | Check redirect URL in Supabase Auth settings |
+| "Too many questions" (429) | You hit the rate limit (5 per minute, 50 per day). Wait a minute and try again |
+| Browser says CORS error | Check `ALLOWED_ORIGINS` in `supabase/functions/_shared/cors.ts`, then redeploy both functions |
 | Changes don't appear | Hard refresh (Ctrl+Shift+R) or try incognito window |
 
 ## Verification
@@ -99,6 +101,7 @@ You should get an AI-generated answer with source citations!
 - [ ] Keyword search returns relevant results
 - [ ] Semantic search returns results even for non-exact-match queries
 - [ ] RAG returns an AI-generated answer with talk citations
+- [ ] You can explain why the browser sends talk ids instead of talk text
 - [ ] 📸 **Take a screenshot** of a working RAG query — you'll need this for submission!
 
 ## 🎉 Milestone: All lights green! Your RAG app is complete!

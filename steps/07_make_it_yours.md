@@ -22,10 +22,18 @@ Congratulations! You built a production-ready RAG application from scratch.
 
 ## 🚀 Add Your Own Feature
 
-**Make this app yours.** Add an interesting feature that demonstrates understanding of the system. If you need ideas:
+**Make this app yours.** Add an interesting feature that demonstrates understanding of the system.
+
+### 📖 Example: Question History (already built)
+
+To show what a complete feature looks like, this repo already includes one: **Question History**. The **🕘 My History** panel lists your past questions and answers. It touches every layer of the stack:
+
+- **Database**: the `question_history` table (created by `01_create_schema.py`), with Row Level Security so each user can only read and insert **their own** rows. You can prove that with `scripts/sql/test_question_history_rls.sql`.
+- **Frontend**: `app.js` saves each answer with `saveHistory()` and shows the list with `loadHistory()`.
+
+Read it end to end (ask your AI assistant to trace a question from the input box into the table and back) and use it as a pattern for your own feature. Yours should be something different. If you need ideas:
 
 - **Ask a specific speaker**: Filter RAG answers to only use talks from a specific speaker
-- **Question history**: Store user questions and answers in a new Supabase table
 - **Embedding caching**: Cache question embeddings to avoid re-calling OpenAI for repeated questions
 - **Analytics dashboard**: Track popular questions and frequently matched talks
 - **Compare search modes**: Show keyword, semantic, and RAG results side-by-side for the same query
@@ -39,9 +47,9 @@ Answer these in your submission. Use your AI assistant to discuss these — it c
 ### 1. Security Architecture ⭐⭐⭐⭐⭐
 
 Draw or describe a diagram showing what protects each sensitive asset in this application. Your answer should address:
-- Why is the anon key safe to expose in `config.public.json`?
-- What would happen if someone got the service role key?
-- How do Edge Functions protect the OpenAI API key?
+- Why is the publishable (anon) key safe to expose in `config.public.json`?
+- What would happen if someone got the secret (service role) key, or your Supabase access token?
+- How do Edge Functions protect the OpenAI API key, and what stops a signed-in user from running up your bill (think rate limits, sign-ups off, and why `generate-answer` takes talk ids instead of text)?
 - What role does Row Level Security play?
 
 ### 2. Edge Functions & the "Secure Middle" ⭐⭐⭐⭐⭐
