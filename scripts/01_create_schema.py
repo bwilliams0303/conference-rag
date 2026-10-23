@@ -7,6 +7,12 @@ in your Supabase database. Also adds:
     - a UNIQUE (talk_id, sentence_num) key so Step 3 can upsert safely
     - CHECK constraints that reject bad season/year/sentence data
     - reset_sentence_embeddings(), which Step 3 calls to empty the table
+    - half-precision (halfvec) embeddings, to fit the 500 MB free tier
+    - set_embeddings(), which Step 5 calls to load embeddings in bulk
+    - consume_rate_limit(), a per-user rate limiter for the edge functions
+
+The vector index is NOT created here: Step 5 builds it after the
+embeddings are loaded.
 
 Safe to re-run: every statement is idempotent.
 
@@ -22,11 +28,15 @@ Prerequisites:
 import json
 import sys
 import time
+from pathlib import Path
+
+# Paths are anchored to the repo root so the script works from any folder
+ROOT = Path(__file__).resolve().parents[1]
 
 # Load configuration from both config files
-with open('config.public.json', 'r') as f:
+with open(ROOT / 'config.public.json', 'r') as f:
     public_config = json.load(f)
-with open('config.secret.json', 'r') as f:
+with open(ROOT / 'config.secret.json', 'r') as f:
     secrets = json.load(f)
 
 SUPABASE_URL = public_config['SUPABASE_URL']
@@ -72,9 +82,27 @@ CREATE TABLE IF NOT EXISTS sentence_embeddings (
     url TEXT,
     sentence_num INTEGER,
     text TEXT NOT NULL,
-    embedding extensions.vector(1536),
+    embedding extensions.halfvec(1536),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Store embeddings as half precision (16-bit floats): half the storage
+-- for the table AND for the vector index, which matters on the free tier's
+-- 500 MB database limit. float16 precision is plenty for ranking
+-- similarity. CREATE TABLE IF NOT EXISTS doesn't touch an existing table,
+-- so convert older vector(1536) columns here. The IF makes re-runs a
+-- no-op: ALTER ... TYPE would rewrite the table and rebuild any index.
+DO $$
+BEGIN
+  IF (SELECT format_type(a.atttypid, a.atttypmod)
+      FROM pg_attribute a
+      WHERE a.attrelid = 'public.sentence_embeddings'::regclass
+        AND a.attname = 'embedding') NOT LIKE '%halfvec(1536)' THEN
+    ALTER TABLE public.sentence_embeddings
+      ALTER COLUMN embedding TYPE extensions.halfvec(1536)
+      USING embedding::extensions.halfvec(1536);
+  END IF;
+END $$;
 
 -- Each talk's sentences are numbered 1, 2, 3, ... exactly once. The
 -- UNIQUE key lets the import upsert (a retried batch updates rows
@@ -187,6 +215,8 @@ GRANT EXECUTE ON FUNCTION page_view_count() TO anon, authenticated;
 -- Create function for similarity search.
 -- SECURITY INVOKER: runs as the caller, so RLS on sentence_embeddings
 -- still applies. match_count is capped so one call can't pull the table.
+-- The browser sends a regular 1536-float vector; it is cast to halfvec
+-- here to match the stored column (and the HNSW index built in Step 5).
 -- Dropped first because CREATE OR REPLACE can't change the return columns.
 DROP FUNCTION IF EXISTS match_sentences(extensions.vector, int);
 CREATE FUNCTION match_sentences(
@@ -205,18 +235,38 @@ RETURNS TABLE (
 LANGUAGE sql STABLE
 SECURITY INVOKER
 SET search_path = public, extensions  -- extensions: pgvector's <=> operator
+-- An HNSW scan returns at most ef_search rows (default 40), so with the
+-- cap of 50 below the default could silently return fewer than asked.
+SET hnsw.ef_search = 100
 AS $$
+  -- The inner LIMIT is a constant on purpose: the planner can't see through
+  -- LEAST(GREATEST(match_count, 1), 50), guesses it wants 10% of the table,
+  -- and then prefers a full scan + sort over the HNSW index. The inner query
+  -- always fetches the 50 nearest rows via the index; the outer query trims
+  -- to match_count.
   SELECT
-    sentence_embeddings.id,
-    sentence_embeddings.talk_id,
-    sentence_embeddings.title,
-    sentence_embeddings.speaker,
-    sentence_embeddings.url,
-    sentence_embeddings.text,
-    1 - (sentence_embeddings.embedding <=> query_embedding) as similarity
-  FROM sentence_embeddings
-  WHERE sentence_embeddings.embedding IS NOT NULL
-  ORDER BY sentence_embeddings.embedding <=> query_embedding
+    nearest.id,
+    nearest.talk_id,
+    nearest.title,
+    nearest.speaker,
+    nearest.url,
+    nearest.text,
+    1 - nearest.distance as similarity
+  FROM (
+    SELECT
+      sentence_embeddings.id,
+      sentence_embeddings.talk_id,
+      sentence_embeddings.title,
+      sentence_embeddings.speaker,
+      sentence_embeddings.url,
+      sentence_embeddings.text,
+      sentence_embeddings.embedding <=> query_embedding::extensions.halfvec(1536) as distance
+    FROM sentence_embeddings
+    WHERE sentence_embeddings.embedding IS NOT NULL
+    ORDER BY sentence_embeddings.embedding <=> query_embedding::extensions.halfvec(1536)
+    LIMIT 50
+  ) nearest
+  ORDER BY nearest.distance
   LIMIT LEAST(GREATEST(match_count, 1), 50);
 $$;
 
@@ -244,6 +294,112 @@ $$;
 
 REVOKE ALL ON FUNCTION public.reset_sentence_embeddings() FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.reset_sentence_embeddings() TO service_role;
+
+-- Bulk-loads embeddings (Step 5). This is an UPDATE function, not a
+-- PostgREST upsert: an upsert that sends only some columns still fails
+-- the NOT NULL checks on title/text before conflict handling kicks in.
+-- One set-based UPDATE per batch is also much faster than row-by-row
+-- calls. Each element of rows looks like
+--   {"talk_id": "<uuid>", "sentence_num": 7, "embedding": "[0.1,0.2,...]"}
+-- Returns how many rows were updated, so the caller can spot missing rows.
+-- Only service_role may call it (same pattern as reset_sentence_embeddings).
+CREATE OR REPLACE FUNCTION public.set_embeddings(rows jsonb)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  n integer;
+BEGIN
+  UPDATE public.sentence_embeddings s
+  SET embedding = (r->>'embedding')::extensions.halfvec(1536)
+  FROM jsonb_array_elements(rows) r
+  WHERE s.talk_id = (r->>'talk_id')::uuid
+    AND s.sentence_num = (r->>'sentence_num')::int;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.set_embeddings(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_embeddings(jsonb) TO service_role;
+
+-- ============================================
+-- Per-user rate limiting (for the edge functions)
+-- ============================================
+-- Each edge function calls consume_rate_limit() with the signed-in
+-- user's own JWT, so no secret key is needed there. Counters live in
+-- one row per (user, bucket, time window).
+
+CREATE TABLE IF NOT EXISTS public.api_rate_limits (
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    bucket TEXT NOT NULL,            -- e.g. 'embed-question:minute'
+    window_start TIMESTAMPTZ NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, bucket, window_start)
+);
+
+-- RLS on with no policies, and no privileges for the API roles: users
+-- can't read or write counters directly (or they could reset their own)
+ALTER TABLE public.api_rate_limits ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.api_rate_limits FROM anon, authenticated;
+
+-- SECURITY DEFINER: runs as the table owner so it can write the table that
+-- users themselves can't touch. That makes it powerful, so: search_path is
+-- pinned, the user's identity comes from auth.uid() (the verified JWT, never
+-- a parameter the caller could fake), and the limits are hard-coded here so
+-- callers can't pick their own. The Supabase advisor will flag this as an
+-- authenticated-executable SECURITY DEFINER function; that is intentional.
+-- Returns true if the call is allowed, false if the user is over a limit.
+CREATE OR REPLACE FUNCTION public.consume_rate_limit(p_bucket text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  uid uuid := auth.uid();
+  per_minute integer;
+  per_day integer;
+  used integer;
+BEGIN
+  IF uid IS NULL THEN
+    RAISE EXCEPTION 'not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_bucket = 'embed-question' THEN
+    per_minute := 20;  per_day := 300;
+  ELSIF p_bucket = 'generate-answer' THEN
+    per_minute := 5;   per_day := 50;
+  ELSE
+    RAISE EXCEPTION 'unknown rate limit bucket: %', p_bucket USING ERRCODE = '22023';
+  END IF;
+
+  -- Forget this user's old counters (cheap: the primary key starts with user_id)
+  DELETE FROM public.api_rate_limits
+  WHERE user_id = uid AND window_start < now() - interval '2 days';
+
+  -- INSERT ... ON CONFLICT DO UPDATE is atomic, so concurrent calls
+  -- can't both read the same count and slip past the limit
+  INSERT INTO public.api_rate_limits AS l (user_id, bucket, window_start, count)
+  VALUES (uid, p_bucket || ':minute', date_trunc('minute', now()), 1)
+  ON CONFLICT (user_id, bucket, window_start) DO UPDATE SET count = l.count + 1
+  RETURNING l.count INTO used;
+  IF used > per_minute THEN
+    RETURN false;
+  END IF;
+
+  INSERT INTO public.api_rate_limits AS l (user_id, bucket, window_start, count)
+  VALUES (uid, p_bucket || ':day', date_trunc('day', now(), 'UTC'), 1)
+  ON CONFLICT (user_id, bucket, window_start) DO UPDATE SET count = l.count + 1
+  RETURNING l.count INTO used;
+  RETURN used <= per_day;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.consume_rate_limit(text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.consume_rate_limit(text) TO authenticated;
 
 -- Tell PostgREST to reload its schema cache so the API sees the new
 -- function (and constraints) right away
