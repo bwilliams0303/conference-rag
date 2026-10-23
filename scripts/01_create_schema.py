@@ -67,9 +67,9 @@ ALTER TABLE sentence_embeddings ENABLE ROW LEVEL SECURITY;
 
 -- Privileges are checked before RLS: only service_role (which bypasses
 -- RLS) writes this table. SELECT stays granted so RLS decides who
--- sees rows (anon gets zero rows rather than an error).
-REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
-ON sentence_embeddings FROM anon, authenticated;
+-- sees rows (anon gets zero rows rather than an error). REVOKE ALL also
+-- covers privileges newer Postgres versions add (e.g. MAINTAIN in 17).
+REVOKE ALL ON sentence_embeddings FROM anon, authenticated;
 GRANT SELECT ON sentence_embeddings TO anon, authenticated;
 
 -- RLS policy: authenticated users can read
