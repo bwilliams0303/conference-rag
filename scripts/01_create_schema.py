@@ -3,7 +3,12 @@ Step 1: Create Database Schema
 ================================
 Creates the sentence_embeddings table, pgvector extension,
 Row Level Security policies, and the match_sentences() function
-in your Supabase database.
+in your Supabase database. Also adds:
+    - a UNIQUE (talk_id, sentence_num) key so Step 3 can upsert safely
+    - CHECK constraints that reject bad season/year/sentence data
+    - reset_sentence_embeddings(), which Step 3 calls to empty the table
+
+Safe to re-run: every statement is idempotent.
 
 Usage:
     python scripts/01_create_schema.py
@@ -71,9 +76,33 @@ CREATE TABLE IF NOT EXISTS sentence_embeddings (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Create index for talk_id grouping
-CREATE INDEX IF NOT EXISTS sentence_embeddings_talk_id_idx 
-ON sentence_embeddings(talk_id);
+-- Each talk's sentences are numbered 1, 2, 3, ... exactly once. The
+-- UNIQUE key lets the import upsert (a retried batch updates rows
+-- instead of duplicating them). CREATE TABLE IF NOT EXISTS doesn't
+-- touch an existing table, so constraints are (re)added with ALTER.
+ALTER TABLE sentence_embeddings ALTER COLUMN sentence_num SET NOT NULL;
+ALTER TABLE sentence_embeddings DROP CONSTRAINT IF EXISTS sentence_embeddings_talk_sentence_key;
+ALTER TABLE sentence_embeddings ADD CONSTRAINT sentence_embeddings_talk_sentence_key
+    UNIQUE (talk_id, sentence_num);
+
+-- The unique index leads with talk_id, so it also serves talk_id
+-- lookups and app.js's ORDER BY talk_id, sentence_num. The old
+-- single-column index is redundant.
+DROP INDEX IF EXISTS sentence_embeddings_talk_id_idx;
+
+-- Reject obviously bad rows at the database, whoever writes them
+ALTER TABLE sentence_embeddings DROP CONSTRAINT IF EXISTS sentence_embeddings_season_check;
+ALTER TABLE sentence_embeddings ADD CONSTRAINT sentence_embeddings_season_check
+    CHECK (season IN ('April', 'October'));
+ALTER TABLE sentence_embeddings DROP CONSTRAINT IF EXISTS sentence_embeddings_year_check;
+ALTER TABLE sentence_embeddings ADD CONSTRAINT sentence_embeddings_year_check
+    CHECK (year BETWEEN 1971 AND 2100);
+ALTER TABLE sentence_embeddings DROP CONSTRAINT IF EXISTS sentence_embeddings_sentence_num_check;
+ALTER TABLE sentence_embeddings ADD CONSTRAINT sentence_embeddings_sentence_num_check
+    CHECK (sentence_num >= 1);
+ALTER TABLE sentence_embeddings DROP CONSTRAINT IF EXISTS sentence_embeddings_text_check;
+ALTER TABLE sentence_embeddings ADD CONSTRAINT sentence_embeddings_text_check
+    CHECK (char_length(text) > 0);
 
 -- Enable Row Level Security
 ALTER TABLE sentence_embeddings ENABLE ROW LEVEL SECURITY;
@@ -195,6 +224,30 @@ $$;
 -- grants anon). Only logged-in users need semantic search.
 REVOKE ALL ON FUNCTION match_sentences(extensions.vector, int) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION match_sentences(extensions.vector, int) TO authenticated, service_role;
+
+-- Empties sentence_embeddings before a fresh import (Step 3). TRUNCATE
+-- is instant, unlike DELETE through the API. SECURITY INVOKER is enough:
+-- the caller needs TRUNCATE itself, and service_role keeps it via
+-- Supabase's default grants (our REVOKE ALL above only targets
+-- anon/authenticated). EXECUTE is also revoked from the API roles so
+-- they can't call it at all, even if table grants change later.
+CREATE OR REPLACE FUNCTION public.reset_sentence_embeddings()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+BEGIN
+  TRUNCATE TABLE public.sentence_embeddings;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.reset_sentence_embeddings() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reset_sentence_embeddings() TO service_role;
+
+-- Tell PostgREST to reload its schema cache so the API sees the new
+-- function (and constraints) right away
+NOTIFY pgrst, 'reload schema';
 """
 
     url = f"https://api.supabase.com/v1/projects/{SUPABASE_PROJECT_REF}/database/query"
