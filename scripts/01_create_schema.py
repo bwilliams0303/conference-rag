@@ -39,8 +39,21 @@ def create_schema():
     print("=" * 60)
 
     schema_sql = """
--- Enable pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
+-- Enable pgvector in the extensions schema, not the API-exposed public schema
+CREATE SCHEMA IF NOT EXISTS extensions;
+GRANT USAGE ON SCHEMA extensions TO anon, authenticated, service_role;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
+
+-- Earlier versions of this script installed pgvector in public; move it.
+-- Existing vector columns and functions follow, since they reference the
+-- type by OID rather than by name.
+DO $$
+BEGIN
+  IF (SELECT extnamespace FROM pg_extension WHERE extname = 'vector')
+     <> 'extensions'::regnamespace THEN
+    ALTER EXTENSION vector SET SCHEMA extensions;
+  END IF;
+END $$;
 
 -- Create sentence_embeddings table
 CREATE TABLE IF NOT EXISTS sentence_embeddings (
@@ -54,7 +67,7 @@ CREATE TABLE IF NOT EXISTS sentence_embeddings (
     url TEXT,
     sentence_num INTEGER,
     text TEXT NOT NULL,
-    embedding vector(1536),
+    embedding extensions.vector(1536),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -146,9 +159,9 @@ GRANT EXECUTE ON FUNCTION page_view_count() TO anon, authenticated;
 -- SECURITY INVOKER: runs as the caller, so RLS on sentence_embeddings
 -- still applies. match_count is capped so one call can't pull the table.
 -- Dropped first because CREATE OR REPLACE can't change the return columns.
-DROP FUNCTION IF EXISTS match_sentences(vector, int);
+DROP FUNCTION IF EXISTS match_sentences(extensions.vector, int);
 CREATE FUNCTION match_sentences(
-  query_embedding vector(1536),
+  query_embedding extensions.vector(1536),
   match_count int DEFAULT 20
 )
 RETURNS TABLE (
@@ -162,7 +175,7 @@ RETURNS TABLE (
 )
 LANGUAGE sql STABLE
 SECURITY INVOKER
-SET search_path = public
+SET search_path = public, extensions  -- extensions: pgvector's <=> operator
 AS $$
   SELECT
     sentence_embeddings.id,
@@ -180,8 +193,8 @@ $$;
 
 -- New functions are executable by PUBLIC by default (and Supabase also
 -- grants anon). Only logged-in users need semantic search.
-REVOKE ALL ON FUNCTION match_sentences(vector, int) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION match_sentences(vector, int) TO authenticated, service_role;
+REVOKE ALL ON FUNCTION match_sentences(extensions.vector, int) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION match_sentences(extensions.vector, int) TO authenticated, service_role;
 """
 
     url = f"https://api.supabase.com/v1/projects/{SUPABASE_PROJECT_REF}/database/query"
