@@ -336,12 +336,13 @@ async function checkSearchReadiness() {
             hasEmbeddings = !error && count > 0;
         }
 
-        // --- 1 embed-question call (only if DB has embeddings) ---
+        // --- 1 embed-question ping (only if DB has embeddings) ---
+        // A ping checks deployment + auth without spending an OpenAI call
         let semanticReady = false;
         if (hasEmbeddings) {
             try {
                 const { data, error: fnError } = await supabaseClient.functions.invoke('embed-question', {
-                    body: { question: 'test' }
+                    body: { ping: true }
                 });
                 semanticReady = !fnError;
             } catch {
@@ -583,6 +584,18 @@ async function askQuestion() {
 // SHARED SEARCH UTILITIES
 // ============================================
 
+// On a non-2xx response, functions.invoke returns data = null and puts the
+// Response in error.context, so read the function's { error } message there
+async function functionErrorMessage(error, fallback) {
+    try {
+        const body = await error.context.json();
+        if (body?.error) return body.error;
+    } catch {
+        // Not an HTTP error (network/CORS) or not a JSON body
+    }
+    return fallback;
+}
+
 // Get embedding via Edge Function
 async function getEmbedding(text) {
     const { data, error } = await supabaseClient.functions.invoke('embed-question', {
@@ -590,7 +603,7 @@ async function getEmbedding(text) {
     });
 
     if (error) {
-        throw new Error(data?.error || 'Failed to get embedding');
+        throw new Error(await functionErrorMessage(error, 'Failed to get embedding'));
     }
 
     return data.embedding;
@@ -690,7 +703,7 @@ async function generateAnswer(question, contextTalks) {
     });
 
     if (error) {
-        throw new Error(data?.error || 'Failed to generate answer');
+        throw new Error(await functionErrorMessage(error, 'Failed to generate answer'));
     }
 
     return data.answer;
