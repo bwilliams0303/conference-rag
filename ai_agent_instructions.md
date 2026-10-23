@@ -135,10 +135,10 @@ Scripts save intermediate data to `scripts/output/` — **encourage students to 
 |--------|--------|------------------|
 | `02_scrape_data.py` | `scripts/output/talks.json` | Raw talk data (title, speaker, text) |
 | `03_import_data.py` | `scripts/output/sentences.json` | Talks split into individual sentences |
-| `04_embed_data.py` | `scripts/output/sentences_with_embeddings.json` | Sentences with 1,536-dim vectors added |
+| `04_embed_data.py` | `scripts/output/embeddings.jsonl` | One line per sentence: `talk_id`, `sentence_num`, a text hash, and the 1,536-dim vector (base64 float32) |
 | `05_update_embeddings.py` | (updates database) | Embeddings imported to Supabase |
 
-The embedding step (04) is separated from the database import (05) so that a database error won't waste the ~$0.60 in OpenAI API costs. The embedding file is saved to disk as a safety net.
+The embedding step (04) is separated from the database import (05) so that a database error won't waste OpenAI API spend (about $0.01–0.02 for ~26,000 sentences; `04_embed_data.py --dry-run` prints the estimate). The embedding file is saved to disk as a safety net.
 
 ## Edge Function Implementation Notes
 
@@ -159,22 +159,28 @@ In Steps 05-06, students are asked to **create their own Edge Functions** with h
 
 ### Auth Pattern (Important!)
 
-Supabase is currently transitioning its JWT verification approach. Students should:
-1. Deploy with `--no-verify-jwt` flag
-2. Handle authentication **manually inside the function** by extracting the JWT from the `Authorization` header and verifying it against Supabase Auth
-3. Use a shared auth helper module at `supabase/functions/_shared/auth.ts`
+Supabase has moved to publishable/secret API keys and asymmetric (ES256) JWT signing keys, and is retiring the legacy anon/service_role keys. Students should:
+1. Keep `verify_jwt = true` (the default) in `supabase/config.toml`, so the platform rejects requests without a valid JWT
+2. Inside the function, confirm the JWT belongs to a signed-in **user** with `createSupabaseContext(req, { auth: 'user' })` from the official `@supabase/server` package (pin an exact version). It verifies the JWT locally against `SUPABASE_JWKS`. `supabase.auth.getUser()` is a slower fallback that also catches revoked sessions
+3. Not read the legacy `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` env vars
+4. Use a shared auth helper module at `supabase/functions/_shared/auth.ts`
 
-### Reference Implementation
+The older pattern (deploy with `--no-verify-jwt` and verify manually, as in [github.com/michaeltreynolds/cragger](https://github.com/michaeltreynolds/cragger/tree/main/supabase/functions)) worked around an earlier gateway limitation; it still works as a fallback but reads the legacy anon key.
 
-A working implementation is available at: [github.com/michaeltreynolds/cragger/tree/main/supabase/functions](https://github.com/michaeltreynolds/cragger/tree/main/supabase/functions)
+### Protecting the OpenAI Key
 
-Students are encouraged to reference this, but should write their own version with your help so they understand the code.
+The key is server-side, but anyone who can call the function can spend it. Layers to teach:
+- **Auth**: only signed-in users (and sign-ups can be turned off)
+- **Input limits**: max body size and question length cap tokens per call
+- **Per-user rate limit**: `consume_rate_limit()` is called with the *user's* token and reads `auth.uid()` from the verified JWT; the table is not writable by users, so they can't reset their own counters
+- **CORS** limited to the student's GitHub Pages origin (defense in depth; it doesn't stop non-browser clients)
+- **A budget limit** on the OpenAI project key
 
 ### Key Patterns
 - Functions are written in **TypeScript/Deno** (not Node.js)
 - CORS handling is shared via `_shared/cors.ts`
 - Auth verification is shared via `_shared/auth.ts`
-- OpenAI API key is accessed via `Deno.env.get('OPENAI_API_KEY')` (set with `supabase secrets set`)
+- OpenAI API key is accessed via `Deno.env.get('OPENAI_API_KEY')` (set with `supabase secrets set --env-file`, never typed on the command line)
 
 ## Common Student Questions
 

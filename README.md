@@ -30,7 +30,7 @@ Follow the step-by-step guides in the `steps/` folder:
 **Prerequisites:**
 - [Supabase](https://supabase.com) account (free tier)
 - [GitHub](https://github.com) account
-- [OpenAI API key](https://platform.openai.com/api-keys) (~$0.60 usage)
+- [OpenAI API key](https://platform.openai.com/api-keys) (about $0.02 of embeddings, plus RAG answers)
 - Python 3.9+
 - An AI coding assistant (Antigravity, GitHub Copilot, or Cursor)
 
