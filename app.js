@@ -286,6 +286,7 @@ function showApp(user) {
     if (userEmailSpan) userEmailSpan.textContent = user.email;
     // Check search readiness when user logs in
     checkSearchReadiness();
+    loadHistory();
 }
 
 function showMessage(text, type) {
@@ -351,15 +352,15 @@ async function checkSearchReadiness() {
         }
         setSearchReady('semantic', semanticReady);
 
-        // --- 1 generate-answer call (only if semantic pipeline is ready) ---
+        // --- 1 generate-answer ping (only if semantic pipeline is ready) ---
         if (!semanticReady) {
             setSearchReady('rag', false);
         } else {
             try {
                 const { data, error: fnError } = await supabaseClient.functions.invoke('generate-answer', {
-                    body: { question: 'test', context_talks: [] }
+                    body: { ping: true }
                 });
-                setSearchReady('rag', !fnError || fnError.context?.status !== 404);
+                setSearchReady('rag', !fnError);
             } catch {
                 setSearchReady('rag', false);
             }
@@ -448,7 +449,7 @@ async function keywordSearch() {
         let html = '';
         for (const talk of Object.values(talks)) {
             html += `<div class="result-card">
-                <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
+                <div class="result-title"><a href="${safeUrl(talk.url)}" target="_blank" rel="noopener noreferrer" class="result-title-link">${escapeHtml(talk.title)}</a></div>
                 <div class="result-speaker">by ${escapeHtml(talk.speaker)}</div>
                 <div class="result-sentences">${talk.sentences.slice(0, 3).join('<br>')}</div>
             </div>`;
@@ -499,7 +500,7 @@ async function semanticSearch() {
             html += `<div class="result-card">
                 <div class="result-card-header">
                     <div>
-                        <div class="result-title"><a href="${escapeHtml(result.url)}" target="_blank" class="result-title-link">${escapeHtml(result.title)}</a></div>
+                        <div class="result-title"><a href="${safeUrl(result.url)}" target="_blank" rel="noopener noreferrer" class="result-title-link">${escapeHtml(result.title)}</a></div>
                         <div class="result-speaker">by ${escapeHtml(result.speaker)}</div>
                     </div>
                     ${badge}
@@ -535,13 +536,20 @@ async function askQuestion() {
         const results = await searchSentences(embedding);
 
         // Step 3: Group by talk (with similarity scores and URLs)
-        const topTalks = groupByTalk(results);
+        const topTalks = groupByTalk(results || []);
+        if (!topTalks.length) {
+            showResults('rag', '<div class="no-results">No related talks found for that question.</div>');
+            return;
+        }
 
-        // Step 4: Fetch full talk text for richer context
-        const enrichedTalks = await fetchFullTalkText(topTalks);
+        // Step 4: Generate the answer. Only talk ids are sent; the Edge
+        // Function fetches the talk text itself, so the browser can't
+        // inject its own "context" into the prompt
+        const talkIds = topTalks.map(t => t.talk_id);
+        const answer = await generateAnswer(question, talkIds);
 
-        // Step 5: Generate answer with full context
-        const answer = await generateAnswer(question, enrichedTalks);
+        // Step 5: Save to the user's history (RLS: only they can read it)
+        saveHistory(question, answer, talkIds);
 
         // Compute overall similarity (weighted avg across source talks)
         const overallSimilarity = topTalks.reduce((sum, t) => sum + t.avgSimilarity, 0) / topTalks.length;
@@ -564,7 +572,7 @@ async function askQuestion() {
             html += `<div class="result-card result-source">
                 <div class="result-card-header">
                     <div>
-                        <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
+                        <div class="result-title"><a href="${safeUrl(talk.url)}" target="_blank" rel="noopener noreferrer" class="result-title-link">${escapeHtml(talk.title)}</a></div>
                         <div class="result-speaker">by ${escapeHtml(talk.speaker)}</div>
                     </div>
                     ${talkBadge}
@@ -658,47 +666,12 @@ function groupByTalk(sentences) {
         }));
 }
 
-// Fetch full talk text by querying all sentences for given talk_ids, ordered by sentence_num.
-// Uses a single batched query via .in() for all talk_ids — no parallel calls needed.
-async function fetchFullTalkText(talks) {
-    if (!supabaseClient || !talks.length) return talks;
-
-    const talkIds = talks.map(t => t.talk_id);
-
-    const { data, error } = await supabaseClient
-        .from('sentence_embeddings')
-        .select('talk_id, sentence_num, text')
-        .in('talk_id', talkIds)
-        .order('talk_id')
-        .order('sentence_num');
-
-    if (error || !data) {
-        console.warn('Failed to fetch full talk text, using snippets:', error?.message);
-        return talks;
-    }
-
-    // Group fetched sentences by talk_id
-    const fullTextMap = {};
-    for (const row of data) {
-        if (!fullTextMap[row.talk_id]) fullTextMap[row.talk_id] = [];
-        fullTextMap[row.talk_id].push(row.text);
-    }
-
-    // Replace snippet text with full talk text
-    return talks.map(talk => ({
-        ...talk,
-        text: fullTextMap[talk.talk_id]
-            ? fullTextMap[talk.talk_id].join(' ')
-            : talk.text
-    }));
-}
-
-// Generate answer via Edge Function
-async function generateAnswer(question, contextTalks) {
+// Generate answer via Edge Function (it fetches the talks' full text itself)
+async function generateAnswer(question, talkIds) {
     const { data, error } = await supabaseClient.functions.invoke('generate-answer', {
         body: {
             question: question,
-            context_talks: contextTalks
+            talk_ids: talkIds
         }
     });
 
@@ -707,6 +680,53 @@ async function generateAnswer(question, contextTalks) {
     }
 
     return data.answer;
+}
+
+// ============================================
+// QUESTION HISTORY (Step 7 feature)
+// ============================================
+// question_history's RLS policies only let a user insert and read rows
+// where user_id = auth.uid(); user_id is filled in by the database.
+
+async function saveHistory(question, answer, talkIds) {
+    const { error } = await supabaseClient
+        .from('question_history')
+        .insert({ question, answer: answer.slice(0, 20000), source_talk_ids: talkIds });
+    if (error) {
+        console.warn('Could not save question history:', error.message);
+        return;
+    }
+    loadHistory();
+}
+
+async function loadHistory() {
+    if (!supabaseClient) return;
+    const { data, error } = await supabaseClient
+        .from('question_history')
+        .select('question, answer, source_talk_ids, created_at')
+        .order('created_at', { ascending: false })
+        .limit(20);
+
+    if (error) {
+        showResults('history', `<div class="result-error">Could not load history: ${escapeHtml(error.message)}</div>`);
+        return;
+    }
+    if (!data.length) {
+        showResults('history', '<div class="no-results">No questions yet. Ask one above!</div>');
+        return;
+    }
+
+    showResults('history', data.map(row => `
+        <div class="result-card history-item">
+            <div class="result-card-header">
+                <div class="result-title">${escapeHtml(row.question)}</div>
+                <div class="result-speaker">${escapeHtml(new Date(row.created_at).toLocaleString())}</div>
+            </div>
+            <details>
+                <summary>Answer (${row.source_talk_ids.length} source talk${row.source_talk_ids.length === 1 ? '' : 's'})</summary>
+                <div class="result-sentences">${escapeHtml(row.answer)}</div>
+            </details>
+        </div>`).join(''));
 }
 
 // ============================================
@@ -726,7 +746,14 @@ function clearResults(type) {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML;
+    // textContent/innerHTML escapes & < > but not quotes, which matter
+    // inside attributes like href="..."
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Only https links (no javascript: URLs), escaped for an href attribute
+function safeUrl(url) {
+    return typeof url === 'string' && url.startsWith('https://') ? escapeHtml(url) : '#';
 }
 
 // Similarity badge with color coding
@@ -800,19 +827,11 @@ function recordPageView() {
 
     const pageViewsEl = document.getElementById('page-views-count');
 
-    // Insert a page view (best-effort, no auth required)
-    // Only origin + path: after a magic-link login the URL hash carries
-    // access/refresh tokens, and the query string can carry auth codes.
+    // Count a visit (best-effort, no auth required). record_page_view()
+    // increments a per-day counter and returns the total, so visitors
+    // can't add rows to the database. Nothing about the visitor is stored.
     supabaseClient
-        .from('page_views')
-        .insert({
-            page_url: window.location.origin + window.location.pathname,
-            user_agent: navigator.userAgent
-        })
-        .then(() => {
-            // Query the total count
-            return supabaseClient.rpc('page_view_count');
-        })
+        .rpc('record_page_view')
         .then(({ data: count }) => {
             if (pageViewsEl && count != null) {
                 pageViewsEl.textContent = count.toLocaleString();

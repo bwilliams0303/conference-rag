@@ -419,3 +419,6 @@ enabled = true
 # that the JWT belongs to a signed-in user (supabase/functions/_shared/auth.ts).
 [functions.embed-question]
 verify_jwt = true
+
+[functions.generate-answer]
+verify_jwt = true

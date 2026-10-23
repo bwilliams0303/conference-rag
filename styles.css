@@ -762,3 +762,13 @@ input:focus {
         flex-direction: column;
     }
 }
+/* Keep paragraph breaks in AI answers */
+.rag-answer .result-sentences,
+.history-item .result-sentences {
+    white-space: pre-wrap;
+}
+
+.history-item summary {
+    cursor: pointer;
+    margin-top: 0.5rem;
+}

@@ -132,6 +132,16 @@
                     </div>
                     <div class="search-results" id="rag-results"></div>
                 </div>
+
+                <!-- Panel 4: My question history (Step 7 feature) -->
+                <div class="search-panel" id="history-panel">
+                    <div class="panel-header">
+                        <h3>🕘 My History</h3>
+                    </div>
+                    <p class="panel-description">Your last 20 questions and answers. Only you can see these
+                        (Row Level Security).</p>
+                    <div class="search-results" id="history-results"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -142,7 +152,7 @@
     </div>
 
     <!-- Supabase JS Client -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"></script>
 
     <!-- Configuration (Students will replace this) -->
     <script src="config.js"></script>
