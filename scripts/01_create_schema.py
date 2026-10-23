@@ -10,6 +10,8 @@ in your Supabase database. Also adds:
     - half-precision (halfvec) embeddings, to fit the 500 MB free tier
     - set_embeddings(), which Step 5 calls to load embeddings in bulk
     - consume_rate_limit(), a per-user rate limiter for the edge functions
+    - question_history, each user's private log of past questions/answers
+    - page_view_daily + record_page_view(), a page counter that can't grow per visit
 
 The vector index is NOT created here: Step 5 builds it after the
 embeddings are loaded.
@@ -182,35 +184,58 @@ ALTER TABLE page_views ENABLE ROW LEVEL SECURITY;
 
 -- Privileges are checked before RLS. Supabase grants anon/authenticated
 -- everything by default (including TRUNCATE, which RLS ignores), so
--- revoke it all and allow inserting only the two client-supplied
--- columns. id and visited_at always come from their defaults.
+-- revoke it all. The site no longer writes a row per visit: anyone could
+-- insert rows without limit and fill the database (and count(*) over
+-- every row on each page load doesn't scale). Old rows are kept and still
+-- counted; new visits go to page_view_daily below.
 REVOKE ALL ON page_views FROM anon, authenticated;
-GRANT INSERT (page_url, user_agent) ON page_views TO anon, authenticated;
-
--- Anyone (including unauthenticated visitors) can insert page views
 DROP POLICY IF EXISTS "Allow public inserts" ON page_views;
-CREATE POLICY "Allow public inserts"
-ON page_views FOR INSERT
-TO anon, authenticated
-WITH CHECK (true);
 
 -- No SELECT policy: nobody can read individual rows through the API
 DROP POLICY IF EXISTS "Allow public reads" ON page_views;
 
--- The counter only needs a number. SECURITY DEFINER runs as the
--- table owner (bypassing RLS), so it must pin search_path and expose
--- nothing but the count.
-CREATE OR REPLACE FUNCTION page_view_count()
+-- One row per day: the table grows by 365 rows a year no matter how many
+-- visitors (or bots) there are
+CREATE TABLE IF NOT EXISTS public.page_view_daily (
+    day DATE PRIMARY KEY,
+    views BIGINT NOT NULL DEFAULT 0
+);
+ALTER TABLE public.page_view_daily ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.page_view_daily FROM anon, authenticated;
+
+-- The counter only needs a number. These run as the table owner
+-- (SECURITY DEFINER, bypassing RLS), so they pin search_path, take no
+-- input, and expose nothing but the total.
+CREATE OR REPLACE FUNCTION public.page_view_count()
 RETURNS bigint
 LANGUAGE sql STABLE
 SECURITY DEFINER
 SET search_path = ''
 AS $$
-  SELECT count(*) FROM public.page_views;
+  SELECT coalesce((SELECT sum(views) FROM public.page_view_daily), 0)::bigint
+       + (SELECT count(*) FROM public.page_views);
 $$;
 
-REVOKE ALL ON FUNCTION page_view_count() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION page_view_count() TO anon, authenticated;
+-- Counts one visit and returns the new total. Abuse can only inflate the
+-- number; it can't add storage.
+CREATE OR REPLACE FUNCTION public.record_page_view()
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  INSERT INTO public.page_view_daily AS d (day, views)
+  VALUES ((now() AT TIME ZONE 'UTC')::date, 1)
+  ON CONFLICT (day) DO UPDATE SET views = d.views + 1;
+  RETURN public.page_view_count();
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.page_view_count() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.page_view_count() TO anon, authenticated;
+REVOKE ALL ON FUNCTION public.record_page_view() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.record_page_view() TO anon, authenticated;
 
 -- Create function for similarity search.
 -- SECURITY INVOKER: runs as the caller, so RLS on sentence_embeddings
@@ -218,6 +243,11 @@ GRANT EXECUTE ON FUNCTION page_view_count() TO anon, authenticated;
 -- The browser sends a regular 1536-float vector; it is cast to halfvec
 -- here to match the stored column (and the HNSW index built in Step 5).
 -- Dropped first because CREATE OR REPLACE can't change the return columns.
+-- hnsw.ef_search (set on the function below) is defined by pgvector's
+-- library. Until the library is loaded in this session it is only a
+-- placeholder, which non-superusers (Supabase's postgres role) may not
+-- attach to a function. Parsing a halfvec value loads the library.
+SELECT '[1]'::extensions.halfvec;
 DROP FUNCTION IF EXISTS match_sentences(extensions.vector, int);
 CREATE FUNCTION match_sentences(
   query_embedding extensions.vector(1536),
@@ -400,6 +430,94 @@ $$;
 
 REVOKE ALL ON FUNCTION public.consume_rate_limit(text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.consume_rate_limit(text) TO authenticated;
+
+-- ============================================
+-- Question history (Step 7 feature)
+-- ============================================
+-- Each signed-in user's past questions and the answers they got, so the
+-- app can show "my latest questions". Rows are private to their owner and
+-- append-only from the API: there is no UPDATE or DELETE.
+
+CREATE TABLE IF NOT EXISTS public.question_history (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- The owner comes from the caller's verified JWT, never from the client
+    user_id UUID NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    source_talk_ids UUID[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Size caps apply to every role, so one user can't stuff the 500 MB free
+-- tier. At most 3 source talks are cited per answer.
+ALTER TABLE public.question_history DROP CONSTRAINT IF EXISTS question_history_question_check;
+ALTER TABLE public.question_history ADD CONSTRAINT question_history_question_check
+    CHECK (char_length(question) BETWEEN 1 AND 500);
+ALTER TABLE public.question_history DROP CONSTRAINT IF EXISTS question_history_answer_check;
+ALTER TABLE public.question_history ADD CONSTRAINT question_history_answer_check
+    CHECK (char_length(answer) BETWEEN 1 AND 20000);
+ALTER TABLE public.question_history DROP CONSTRAINT IF EXISTS question_history_source_talk_ids_check;
+ALTER TABLE public.question_history ADD CONSTRAINT question_history_source_talk_ids_check
+    CHECK (cardinality(source_talk_ids) <= 3);
+
+-- Serves "my latest questions" (WHERE user_id = me ORDER BY created_at
+-- DESC) and the user_id filter that the RLS policies add to every query
+CREATE INDEX IF NOT EXISTS question_history_user_created_idx
+    ON public.question_history (user_id, created_at DESC);
+
+ALTER TABLE public.question_history ENABLE ROW LEVEL SECURITY;
+
+-- Privileges are checked before RLS. Users may read rows and insert only
+-- the three columns they supply; id and created_at come from defaults and
+-- user_id from auth.uid(). anon gets nothing, and nobody gets UPDATE or
+-- DELETE, so history can't be rewritten through the API.
+REVOKE ALL ON public.question_history FROM anon, authenticated;
+GRANT SELECT ON public.question_history TO authenticated;
+GRANT INSERT (question, answer, source_talk_ids) ON public.question_history TO authenticated;
+
+-- Two layers on purpose. The column grant stops a client from naming
+-- user_id at all; the WITH CHECK keeps the rule true even if a later
+-- change grants that column (or a SECURITY INVOKER function inserts for
+-- the caller). Each layer covers the other's mistake.
+-- (select auth.uid()) instead of a bare auth.uid(): the subselect is
+-- evaluated once per query as an initPlan, rather than once per row
+-- (Supabase's RLS performance guidance).
+DROP POLICY IF EXISTS "Users read own history" ON public.question_history;
+CREATE POLICY "Users read own history"
+ON public.question_history FOR SELECT
+TO authenticated
+USING ((select auth.uid()) = user_id);
+
+DROP POLICY IF EXISTS "Users insert own history" ON public.question_history;
+CREATE POLICY "Users insert own history"
+ON public.question_history FOR INSERT
+TO authenticated
+WITH CHECK ((select auth.uid()) = user_id);
+
+-- Users insert through the API directly, so cap how fast one account can
+-- grow the table (100 rows x 20 KB max per day). Runs as the inserting
+-- user: RLS means the count only sees their own rows, served by the
+-- (user_id, created_at) index.
+CREATE OR REPLACE FUNCTION public.limit_question_history()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+BEGIN
+  IF (SELECT count(*) FROM public.question_history
+      WHERE user_id = NEW.user_id AND created_at > now() - interval '1 day') >= 100 THEN
+    RAISE EXCEPTION 'question history limit reached (100 per day)' USING ERRCODE = '54000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.limit_question_history() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS question_history_daily_limit ON public.question_history;
+CREATE TRIGGER question_history_daily_limit
+BEFORE INSERT ON public.question_history
+FOR EACH ROW EXECUTE FUNCTION public.limit_question_history();
 
 -- Tell PostgREST to reload its schema cache so the API sees the new
 -- function (and constraints) right away

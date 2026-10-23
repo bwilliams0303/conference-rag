@@ -1,6 +1,6 @@
-requests
-beautifulsoup4
-pandas
-tqdm
-openai
-supabase
+# Python 3.10+ (tested on 3.14). Pinned so a new major version can't break the scripts.
+requests==2.34.2
+beautifulsoup4==4.15.0
+tqdm==4.70.1
+openai==3.37.0
+supabase==2.33.0
