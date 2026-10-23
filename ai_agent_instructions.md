@@ -78,7 +78,7 @@ These are the core concepts students should understand by the end. When opportun
 ### 5. Row Level Security (RLS)
 - **What**: Database-level access control policies that filter data per-user
 - **Why it matters**: Security that can't be bypassed by application bugs — the database itself enforces the rules
-- **Key insight**: The `page_views` table is readable by anyone (public policy), but `sentence_embeddings` requires authentication — same database, same anon key, different policies
+- **Key insight**: Anyone can write to `page_views` and read its total via `page_view_count()`, but `sentence_embeddings` requires authentication — same database, same anon key, different privileges and policies
 - **Teach them**: Run the Step 03 RLS contrast test (query both tables with the anon key), explain the difference between `TO anon` and `TO authenticated` policies, why database-level security is more robust than app-level checks
 
 ### 6. Authentication & Security Architecture
